@@ -1,0 +1,95 @@
+﻿# 在 Windows 上打包旅行清单，输出 dist\TomsCheckList-<版本>-win-x64\。
+# 加上 -Zip 才额外生成同名 zip。-SkipInstall 跳过 pnpm install。
+# 加上 -Start 会在打包完成后运行输出目录里的 install-service.ps1。
+param([switch]$SkipInstall, [switch]$Zip, [switch]$Start)
+$ErrorActionPreference = "Stop"
+
+$Root = Split-Path -Parent $PSScriptRoot
+Set-Location $Root
+
+function Invoke-Step {
+  param([string]$Title, [scriptblock]$Block)
+  Write-Host "==> $Title"
+  & $Block
+  if ($LASTEXITCODE -ne 0) { throw "失败：$Title" }
+}
+
+function Get-NormalizedPath {
+  param([string]$Path)
+  if ([string]::IsNullOrWhiteSpace($Path)) { return "" }
+  return [System.IO.Path]::GetFullPath($Path).TrimEnd('\').ToLowerInvariant()
+}
+
+$NodeVersion = (Get-Content -LiteralPath "scripts\node-version.txt" -Raw).Trim()
+$Version = (Get-Content -LiteralPath "apps\server\package.json" -Raw | ConvertFrom-Json).version
+$Name = "TomsCheckList-$Version-win-x64"
+$Stage = Join-Path $Root "dist\$Name"
+$Cache = Join-Path $Root "dist\cache"
+New-Item -ItemType Directory -Force -Path $Cache | Out-Null
+
+if (-not $SkipInstall) { Invoke-Step "安装依赖" { pnpm install --frozen-lockfile } }
+Invoke-Step "构建 shared" { pnpm --filter @checklist/shared build }
+Invoke-Step "构建 server" { pnpm --filter @checklist/server build }
+Invoke-Step "构建 web" { pnpm --filter @checklist/web build }
+
+if ($Start) {
+  $task = Get-ScheduledTask -TaskName "TomsCheckList" -ErrorAction SilentlyContinue
+  $wd = $null
+  if ($task -and $task.Actions) { $wd = @($task.Actions)[0].WorkingDirectory }
+  if ((Get-NormalizedPath $wd) -eq (Get-NormalizedPath $Stage)) {
+    Write-Host "==> 停止占用输出目录的服务"
+    & (Join-Path $Root "packaging\windows\stop.ps1")
+    Start-Sleep -Seconds 1
+  }
+}
+if (Test-Path -LiteralPath $Stage) { Remove-Item -LiteralPath $Stage -Recurse -Force }
+Invoke-Step "生成生产依赖" { pnpm --filter @checklist/server deploy --prod --config.node-linker=hoisted "dist/$Name/app" }
+Copy-Item -LiteralPath (Join-Path $Root "apps\web\dist") -Destination (Join-Path $Stage "app\public") -Recurse
+
+Write-Host "==> 准备 Node $NodeVersion"
+$zipName = "node-v$NodeVersion-win-x64.zip"
+$zipPath = Join-Path $Cache $zipName
+$sumsPath = Join-Path $Cache "SHASUMS256-$NodeVersion.txt"
+$base = "https://nodejs.org/dist/v$NodeVersion"
+if (-not (Test-Path -LiteralPath $sumsPath)) { Invoke-WebRequest -Uri "$base/SHASUMS256.txt" -OutFile $sumsPath -UseBasicParsing }
+if (-not (Test-Path -LiteralPath $zipPath)) { Invoke-WebRequest -Uri "$base/$zipName" -OutFile $zipPath -UseBasicParsing }
+$expected = (Select-String -LiteralPath $sumsPath -Pattern ([regex]::Escape($zipName)) | Select-Object -First 1).Line.Split(" ")[0]
+$actual = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLower()
+if ($expected -ne $actual) {
+  Remove-Item -LiteralPath $zipPath -Force
+  throw "Node 压缩包校验失败，已删除缓存，请重试"
+}
+$unpack = Join-Path $Cache "node-unpack"
+if (Test-Path -LiteralPath $unpack) { Remove-Item -LiteralPath $unpack -Recurse -Force }
+Expand-Archive -LiteralPath $zipPath -DestinationPath $unpack
+Move-Item -LiteralPath (Join-Path $unpack "node-v$NodeVersion-win-x64") -Destination (Join-Path $Stage "node")
+Remove-Item -LiteralPath $unpack -Recurse -Force
+
+Write-Host "==> 复制启动脚本"
+Copy-Item -LiteralPath (Join-Path $Root "packaging\windows") -Destination (Join-Path $Stage "windows") -Recurse
+$envSource = Join-Path $env:LOCALAPPDATA "TomsCheckList\checklist.env"
+if (-not (Test-Path -LiteralPath $envSource)) {
+  throw "找不到配置文件：$envSource。请先在本机准备好 checklist.env，再重新打包。"
+}
+Copy-Item -LiteralPath $envSource -Destination (Join-Path $Stage "checklist.env")
+$utf8Bom = New-Object System.Text.UTF8Encoding $true
+foreach ($file in Get-ChildItem -LiteralPath (Join-Path $Stage "windows") -Filter "*.ps1") {
+  $text = [System.IO.File]::ReadAllText($file.FullName)
+  [System.IO.File]::WriteAllText($file.FullName, $text, $utf8Bom)
+}
+
+Write-Host "已生成：$Stage"
+if ($Zip) {
+  Write-Host "==> 压缩"
+  $zipOut = Join-Path $Root "dist\$Name.zip"
+  if (Test-Path -LiteralPath $zipOut) { Remove-Item -LiteralPath $zipOut -Force }
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  [System.IO.Compression.ZipFile]::CreateFromDirectory($Stage, $zipOut, [System.IO.Compression.CompressionLevel]::Optimal, $true)
+  $sizeMb = [math]::Round((Get-Item -LiteralPath $zipOut).Length / 1MB, 1)
+  Write-Host "已生成：$zipOut（$sizeMb MB）"
+}
+if ($Start) {
+  Write-Host "==> 安装并启动服务"
+  & (Join-Path $Stage "windows\install-service.ps1")
+  if ($LASTEXITCODE -ne 0) { throw "失败：安装并启动服务" }
+}
